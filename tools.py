@@ -98,12 +98,16 @@ CHATGPT_LIST_SCHEMA = _schema(
 CHATGPT_GET_SCHEMA = _schema(
     "chatgpt_get",
     "Fetch a ChatGPT conversation as a paginated transcript. Returns the "
-    "newest 50 messages as markdown by default; page backwards with offset "
-    "(skip N newest messages) and widen/narrow with limit (max 200). The "
-    "response header states the window and gives the exact offset for the "
-    "previous page. Pass format='json' for the raw API payload (unpaginated, "
-    "can be huge — prefer markdown).",
-    {"conversation_id": _STR, "format": _STR, "limit": _INT, "offset": _INT},
+    "newest messages as markdown, hard-capped at ~40k chars (~10k tokens) "
+    "per page so large conversations never flood context; the oldest "
+    "boundary message is truncated with a marker and re-delivered in full "
+    "on the previous page (no text is lost). Page backwards with offset "
+    "(skip N newest messages), widen/narrow with limit (max 200 messages). "
+    "The response header states the window, approximate token cost, and the "
+    "exact offset for the previous page. Pass format='json' for the raw API "
+    "payload (unpaginated, can be huge — prefer markdown).",
+    {"conversation_id": _STR, "format": _STR, "limit": _INT, "offset": _INT,
+     "max_chars": _INT},
     ("conversation_id",))
 
 CHATGPT_SYNC_SCHEMA = _schema(
@@ -190,7 +194,8 @@ def _handle_get(args, **kw):
     fmt = str(args.get("format") or "markdown").lower()
     a = argparse.Namespace(cmd="get" if fmt == "json" else "get-md", cid=cid,
                            limit=int(args.get("limit") or 50),
-                           offset=int(args.get("offset") or 0))
+                           offset=int(args.get("offset") or 0),
+                           chars=int(args.get("max_chars") or 0))
     out, _ = _run_cli(a)
     if fmt == "json":
         try:

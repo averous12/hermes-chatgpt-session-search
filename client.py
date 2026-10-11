@@ -311,26 +311,57 @@ def cmd_list(a):
         print(f"  {it['id']}  {t}  {(it['title'] or '')[:70]}")
 
 
+# Char budget per markdown page (~10k tokens). Message sizes vary 100x
+# (code dumps vs "ok"), so a char cap bounds context better than count alone.
+PAGE_CHARS = 40000
+
+
 def cmd_get(a, as_md=False):
     d = API().conversation(a.cid)
     if not as_md:
         print(json.dumps(d, indent=2))
         return
-    # Windowed transcript: default the newest `limit` messages; `offset` skips
-    # that many from the END (so offset=50,limit=50 = the previous page).
+    # Windowed transcript: newest `limit` messages, `offset` skips that many
+    # from the END (offset=50,limit=50 = previous page), hard-capped at
+    # `chars` total characters. Walk newest->oldest so the freshest content
+    # always survives; the oldest boundary message is the one truncated, and
+    # it is re-delivered in full on the previous page (not counted in the
+    # next offset), so no text is ever lost between pages.
     msgs = messages_of(d)
     total = len(msgs)
     limit = max(1, min(int(getattr(a, "limit", 0) or 0), 200)) or 50
     offset = max(0, int(getattr(a, "offset", 0) or 0))
-    end = total - offset
-    start = max(0, end - limit)
-    page = msgs[start:end]
+    budget = max(2000, int(getattr(a, "chars", 0) or PAGE_CHARS))
+    end = total - offset                      # exclusive, 0-based
+    lo = max(0, end - limit)
+
+    page, used, cut = [], 0, None             # cut = (msg_index, dropped_chars)
+    for i in range(end - 1, lo - 1, -1):      # newest -> oldest
+        role, t = msgs[i]
+        cost = len(t) + 40                    # role markers + separators
+        room = budget - used
+        if cost > room:
+            keep = max(0, room - 60)
+            cut = (i, len(t) - keep)
+            page.append((role, t[:keep], i))
+            break
+        page.append((role, t, i))
+        used += cost
+    page.reverse()                            # chronological
+
     md = [f"# {d.get('title') or 'Untitled'}", ""]
-    if total > len(page):
-        md.insert(2, f"*messages {start + 1}–{end} of {total} "
-                     f"(newest {offset} skipped; fetch with offset={offset + len(page)} "
-                     f"for the previous page)*\n")
-    for role, t in page:
+    start_num = page[0][2] + 1
+    full = len(page) - (1 if cut else 0)
+    next_offset = offset + full               # partial message is re-fetched
+    shown_chars = sum(len(t) for _, t, _ in page)
+    if cut or offset or end < total:
+        md.insert(2, f"*messages {start_num}–{end} of {total}; "
+                     f"~{shown_chars // 4:,} tokens"
+                     + (f"; last message cut {cut[1]:,} chars" if cut else "")
+                     + f"; offset={next_offset} for the previous page*\n")
+    for n, (role, t, _) in enumerate(page):
+        if cut and n == len(page) - 1:
+            t += f"\n\n…[{cut[1]:,} chars truncated — full text on the previous page]"
         md += ["**You**" if role == "user" else "**ChatGPT**", "", t, ""]
     print("\n".join(md))
 
@@ -526,6 +557,8 @@ if __name__ == "__main__":
                          help="max messages returned (newest window; 1-200)")
         _sp.add_argument("--offset", type=int, default=0,
                          help="skip this many newest messages (page backwards)")
+        _sp.add_argument("--chars", type=int, default=0,
+                         help=f"max chars per page (default {PAGE_CHARS}, ~10k tokens)")
     p = sub.add_parser("sync"); p.add_argument("--tail", type=int, default=None)
     p.add_argument("--jobs", type=int, default=6)
     p = sub.add_parser("find"); p.add_argument("query")
