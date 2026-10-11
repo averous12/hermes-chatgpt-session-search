@@ -76,21 +76,51 @@ Invariants when changing this:
 
 ## Verifying changes (no pytest suite yet)
 
+**Never put the plugin dir on `sys.path`.** Its `tools.py` then shadows Hermes's
+own `tools` package, and `from tools.registry import …` dies with
+`ModuleNotFoundError: 'tools' is not a package`. Load it as a *package* via
+`spec_from_file_location(..., submodule_search_locations=[dir])` — that is what
+the real loader does, and what makes the bare-path import work.
+
 ```bash
 # engine, against the real jar:
-python3 client.py status
-python3 client.py find "timer"
-python3 client.py get-md <conversation-id> --chars 2000   # truncation edge case
+python client.py status
+python client.py find "timer"
+python client.py get-md <conversation-id> --chars 2000   # truncation edge case
 
 # registration smoke test: fake tools.registry + fake ctx, then exec __init__ —
 # assert all 6 tools register and check_fn returns True.
 
 # through the real loader (installed copy must be refreshed first, see below):
 hermes plugins list | grep chatgpt-session-search
+hermes plugins doctor chatgpt-session-search      # expect: 6 tool(s), 0 hook(s)
 hermes chat -q "Call chatgpt_status and report the email" -Q
 ```
 
+Regression script (28 checks: registration, live handlers, fresh-install
+errors, import-cookie error paths): `scratch/plugin_regress.py` in the Hermes
+cache dir — run it from the plugins dir with the Hermes venv python.
+
 Any claim of "works" needs one of the above, not a read-through.
+
+## Setup contract (do not regress)
+
+Setup usability is a first-class feature here — a new user's first two minutes
+decide whether the plugin works.
+
+- **No handler may raise out of the tool boundary.** A missing jar, a corrupt
+  jar, a dead session, or a bad export must come back as `tool_error(...)` with
+  the *fix* in the message. Tracebacks in tool results are a bug.
+- **`chatgpt_status` is the setup report**, ordered as a checklist:
+  `curl_cffi` → jar exists → jar readable → session alive → index size.
+  It ends with `ready: true`, or an `error`, or a `next_step` on a fresh
+  install. Keep those three keys meaningful.
+- **Every tool except `chatgpt_status` guards on the jar** via
+  `_jar_missing_error()` before touching the network.
+- **`chatgpt_import_cookies(index=true)`** does import + verify + index in one
+  call, so setup doesn't require the user to know `sync` exists.
+- Tool descriptions state real latency/cost, and state when a tool is a setup
+  step — the calling agent plans off the description alone.
 
 ## Deploy = copy (two trees, one truth)
 

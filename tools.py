@@ -13,6 +13,7 @@ import io
 import json
 import os
 import sys
+import time
 
 from tools.registry import tool_error, tool_result
 
@@ -24,6 +25,25 @@ def _check_available() -> bool:
         return True
     except Exception:
         return False
+
+
+def _jar_missing_error():
+    """Actionable error for the dominant first-run failure: no cookie jar.
+
+    Every tool except ``chatgpt_status`` needs a jar. Raising a bare
+    RuntimeError out of the handler surfaces as a traceback in the agent's
+    tool result; a tool_error with the exact remediation does not.
+    """
+    client = _client()
+    return tool_error(
+        "not logged in: no ChatGPT cookie jar at "
+        f"{client.MASTER_JAR}. "
+        "Set it up once: (1) log in to chatgpt.com in any browser, "
+        "(2) export cookies as JSON with any cookie extension "
+        "('Get cookies.txt LOCALLY' or Cookie-Editor), "
+        "(3) call chatgpt_import_cookies with the export's path. "
+        "Run chatgpt_status to confirm."
+    )
 
 
 def _client():
@@ -74,9 +94,13 @@ _BOOL = {"type": "boolean"}
 
 CHATGPT_STATUS_SCHEMA = _schema(
     "chatgpt_status",
-    "Check the stored ChatGPT session: whether the cookie jar is alive, the "
-    "account email, and the local search-index size. Run this first when a "
-    "ChatGPT tool errors, or to confirm login after importing cookies.",
+    "Setup/session report — run this FIRST, before any other chatgpt tool. "
+    "Returns a checklist of what is and isn't configured: curl_cffi "
+    "installed, cookie jar present, session alive, account email, cf_clearance "
+    "present, session expiry date, and local index size. On a fresh install it "
+    "returns a 'next_step' telling you how to finish setup. On failure it "
+    "returns 'error' naming the exact problem. Every other chatgpt tool "
+    "returns a plain error if run before setup.",
     {})
 
 CHATGPT_FIND_SCHEMA = _schema(
@@ -121,30 +145,74 @@ CHATGPT_SYNC_SCHEMA = _schema(
 
 CHATGPT_IMPORT_COOKIES_SCHEMA = _schema(
     "chatgpt_import_cookies",
-    "Import a ChatGPT login from a browser-extension cookies export (JSON "
-    "list from e.g. 'Get cookies.txt' / Cookie-Editor, exported while logged "
-    "in to chatgpt.com). Browser-agnostic: works from any browser's export. "
-    "Stores the jar and verifies the session end-to-end.",
-    {"path": _STR},
+    "One-time setup step: import a ChatGPT login from a browser-extension "
+    "cookies export (JSON list from 'Get cookies.txt LOCALLY' / Cookie-Editor, "
+    "exported while LOGGED IN to chatgpt.com). Browser-agnostic. Stores the "
+    "jar at the profile's chatgpt/cookies.master.json, then verifies the "
+    "session end-to-end and returns the account email. Re-run this when "
+    "chatgpt_status reports the session is dead. Optional params: format='markdown'|"
+    "json, index=true to also build the search index.",
+    {"path": _STR, "format": _STR, "index": _BOOL},
     ("path",))
 
 
 # ---------- handlers ----------
 
 def _handle_status(args, **kw):
+    """Setup report: is the plugin usable, and if not, what exactly is missing.
+
+    Ordered as a checklist so a first-run agent can act on it directly.
+    """
     client = _client()
-    payload = {"jar_exists": os.path.exists(client.MASTER_JAR)}
-    if payload["jar_exists"]:
-        try:
-            d = client.API().session()
-            u = d.get("user") or {}
-            payload.update({
-                "hasToken": bool(d.get("accessToken")),
-                "email": u.get("email"),
-                "plan": u.get("chatgpt_plan_type") or u.get("plan_type"),
-            })
-        except Exception as e:
-            payload["error"] = f"{type(e).__name__}: {e}"
+    payload = {"jar_exists": os.path.exists(client.MASTER_JAR),
+               "storage": client.STORAGE}
+    # dependency
+    try:
+        import curl_cffi
+        payload["curl_cffi"] = getattr(curl_cffi, "__version__", "unknown")
+    except Exception as e:
+        payload["curl_cffi"] = None
+        payload["error"] = (
+            f"dependency missing: curl_cffi not importable ({e}). "
+            "Install it into the Hermes venv: "
+            "'<hermes venv>/python -m pip install curl_cffi'")
+        return tool_result(payload)
+
+    if not payload["jar_exists"]:
+        payload["next_step"] = (
+            "no cookie jar — log in to chatgpt.com in any browser, export "
+            "cookies as JSON, then call chatgpt_import_cookies with the "
+            "export's path")
+        return tool_result(payload)
+
+    # jar present: how old / when does it expire
+    try:
+        jar = client.load_jar()
+        payload["cookies"] = len(jar)
+        payload["cf_clearance"] = any(c["name"] == "cf_clearance" for c in jar)
+        exps = [c["expires"] for c in jar
+                if "session-token" in c["name"] and c.get("expires")]
+        if exps:
+            payload["session_expires"] = time.strftime(
+                "%Y-%m-%d", time.localtime(min(exps)))
+    except Exception as e:
+        payload["error"] = f"jar unreadable: {type(e).__name__}: {e}"
+        return tool_result(payload)
+
+    try:
+        d = client.API().session()
+        u = d.get("user") or {}
+        payload.update({
+            "logged_in": bool(d.get("accessToken")),
+            "email": u.get("email"),
+            "plan": u.get("chatgpt_plan_type") or u.get("plan_type"),
+        })
+    except Exception as e:
+        payload["logged_in"] = False
+        payload["error"] = (f"session dead or Cloudflare-blocked: "
+                            f"{type(e).__name__}: {e}. Re-import cookies.")
+        return tool_result(payload)
+
     try:
         import sqlite3
         db = sqlite3.connect(client.INDEX_DB)
@@ -153,6 +221,7 @@ def _handle_status(args, **kw):
         db.close()
     except Exception:
         payload["indexed_conversations"] = 0
+    payload["ready"] = True
     return tool_result(payload)
 
 
@@ -165,6 +234,8 @@ def _handle_find(args, **kw):
     )
     if not a.query:
         return tool_error("query is required")
+    if not os.path.exists(_client().MASTER_JAR):
+        return _jar_missing_error()
     out, err = _run_cli(a)
     stages = [l.strip() for l in err.splitlines() if l.strip().startswith("[find]")]
     return tool_result({"query": a.query, "results": out.strip() or "no matches",
@@ -176,6 +247,8 @@ def _handle_list(args, **kw):
                            limit=int(args.get("limit") or 0),
                            offset=int(args.get("offset") or 0))
     client = _client()
+    if not os.path.exists(client.MASTER_JAR):
+        return _jar_missing_error()
     items = client.API().conversations()
     if a.offset:
         items = items[a.offset:]
@@ -191,6 +264,8 @@ def _handle_get(args, **kw):
     cid = str(args.get("conversation_id") or "").strip()
     if not cid:
         return tool_error("conversation_id is required")
+    if not os.path.exists(_client().MASTER_JAR):
+        return _jar_missing_error()
     fmt = str(args.get("format") or "markdown").lower()
     a = argparse.Namespace(cmd="get" if fmt == "json" else "get-md", cid=cid,
                            limit=int(args.get("limit") or 50),
@@ -206,6 +281,8 @@ def _handle_get(args, **kw):
 
 
 def _handle_sync(args, **kw):
+    if not os.path.exists(_client().MASTER_JAR):
+        return _jar_missing_error()
     a = argparse.Namespace(
         cmd="sync",
         tail=int(args["tail"]) if args.get("tail") not in (None, "") else None,
@@ -237,6 +314,22 @@ def _handle_import_cookies(args, **kw):
     except Exception as e:
         res["verified"] = False
         res["verify_error"] = f"{type(e).__name__}: {e}"
+        res["hint"] = ("jar written but the session didn't verify — the "
+                       "export may be stale; re-export while logged in")
+        return tool_result(res)
+
+    if res["verified"] and bool(args.get("index")):
+        # one-shot setup: import + build the search index immediately, so
+        # chatgpt_find is useful without a separate chatgpt_sync call.
+        try:
+            a = argparse.Namespace(cmd="sync", tail=None, limit=0)
+            out, err = _run_cli(a)
+            res["index"] = [l for l in out.splitlines()
+                            if l.startswith(("index:", "synced"))]
+            if not res["index"]:
+                res["index"] = out.strip().splitlines()[-1:]
+        except Exception as e:
+            res["index_error"] = f"{type(e).__name__}: {e}"
     return tool_result(res)
 
 

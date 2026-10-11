@@ -514,6 +514,10 @@ def import_cookies(export_path):
         raw = json.load(f)
     if not isinstance(raw, list):
         raise RuntimeError("not a cookies export (expected a JSON list)")
+    if not raw:
+        raise RuntimeError(
+            "cookies export is empty — export cookies while logged in to "
+            "chatgpt.com, and check the export includes chatgpt.com")
     samesite = {"lax": "Lax", "strict": "Strict",
                 "no_restriction": "None", "unspecified": "Lax"}
     out = []
@@ -532,9 +536,12 @@ def import_cookies(export_path):
             "expires": int(exp) if exp is not None else None,
         })
     if not any("__Secure-next-auth.session-token" in c["name"] for c in out):
+        found = sorted({c["name"] for c in out})[:8]
         raise RuntimeError(
             "no ChatGPT session token in export — export cookies while "
-            "logged in to chatgpt.com")
+            "LOGGED IN to chatgpt.com (needs "
+            "'__Secure-next-auth.session-token'). "
+            f"Scoped cookies found: {found or 'none'}")
     os.makedirs(STORAGE, mode=0o700, exist_ok=True)
     with open(MASTER_JAR, "w") as f:
         json.dump(out, f, indent=2)

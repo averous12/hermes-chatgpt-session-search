@@ -19,17 +19,61 @@ ChatGPT conversation retrieval for [Hermes Agent](https://github.com/NousResearc
 
 ```bash
 hermes plugins install <your-github-user>/chatgpt-session-search
-pip install curl_cffi     # the only dependency
 ```
 
-Then import your ChatGPT login once:
+Install the one dependency **into the Hermes venv** (not your system Python —
+Hermes imports plugins with its own interpreter, so `pip install curl_cffi`
+in the wrong environment leaves the tools hidden):
+
+```bash
+# Windows
+"C:/Users/<you>/AppData/Local/hermes/hermes-agent/venv/Scripts/python.exe" -m pip install curl_cffi
+# macOS/Linux
+~/.hermes/hermes-agent/venv/bin/python -m pip install curl_cffi
+```
+
+Confirm the install, then enable the plugin and restart the gateway:
+
+```bash
+hermes plugins enable chatgpt-session-search
+hermes plugins doctor chatgpt-session-search   # expect: 6 tool(s), 0 hook(s)
+hermes gateway restart
+```
+
+> **Heads-up:** `hermes plugins enable` takes effect on the next session. In a
+> chat that was already open, the tools won't appear until you start a new one.
+
+### Set up the login (once)
 
 1. Log in to chatgpt.com in **any** browser.
-2. Export cookies with any extension (e.g. "Get cookies.txt LOCALLY" or Cookie-Editor) — JSON format.
-3. Tell the agent: *"import these cookies into the chatgpt plugin: /path/to/cookies.json"*
-   (or run `python3 client.py import-cookies /path/to/cookies.json`).
+2. Export cookies as **JSON** with any cookie extension
+   ("Get cookies.txt LOCALLY", Cookie-Editor, …). Export *while logged in*, and
+   make sure the export includes `chatgpt.com` — a partial export fails with a
+   clear error naming what's missing.
+3. Import them, either by telling the agent:
 
-The jar is stored at `~/.hermes/chatgpt/cookies.master.json` (mode 600). Passwords are never stored.
+   > *"import these cookies into the chatgpt plugin: /path/to/cookies.json"*
+
+   or from a shell (`client.py` is standalone):
+
+   ```bash
+   python client.py import-cookies /path/to/cookies.json
+   ```
+
+4. Verify:
+
+   > *"run chatgpt_status"*
+
+   `"ready": true` with your email means you're done. Any problem is reported
+   as `error` (with the fix) or `next_step` (on a fresh install) — never a raw
+   traceback.
+
+To build the search index at the same time, pass `index=true` to
+`chatgpt_import_cookies` (or run `chatgpt_sync` separately; it's paced and
+incremental, so prefer scheduling it over running it interactively).
+
+The jar is stored at `$HERMES_HOME/chatgpt/cookies.master.json` (mode 600).
+Passwords are never stored.
 
 ## Design
 
@@ -38,6 +82,32 @@ The jar is stored at `~/.hermes/chatgpt/cookies.master.json` (mode 600). Passwor
 - **Search index.** `sync` stores conversation bodies in SQLite FTS5 (`~/.hermes/chatgpt/index.db`) and is incremental via the list endpoint's `update_time`. `find` never waits for sync: it searches live titles + the index, and falls back to live-grepping the most recent unsynced conversations (self-indexing as it goes).
 - **Rate limits.** OpenAI enforces a sliding-window budget (~50 body fetches, then 429s for minutes). The client paces body fetches (2.5s default, `CHATGPT_PACE`) and cools off 90s per 429 (`CHATGPT_COOL`) instead of hammering.
 - **List cache.** The conversation list is cached 5 minutes locally so `find` pays the multi-page round-trip at most once per window.
+
+## Troubleshooting
+
+All tools return a JSON `error` string instead of raising, so the calling agent
+can read the problem and act. `chatgpt_status` is always the first call.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Tools don't appear at all | `curl_cffi` missing from the **Hermes** venv, or plugin not enabled | Install into the Hermes venv (see Install), `hermes plugins enable …`, restart |
+| Tools missing in an already-open chat | `enable` applies next session | Start a new chat |
+| `not logged in: no ChatGPT cookie jar at …` | No jar yet | Run the login setup above |
+| `session dead or Cloudflare-blocked: …` | Session cookie expired or `cf_clearance` stale | Re-export cookies while logged in, `chatgpt_import_cookies` |
+| `no ChatGPT session token in export …` | Export was taken logged-out or scoped to the wrong site | Re-export from chatgpt.com; the error lists the cookies it *did* find |
+| `cookies export is empty` | Cookie extension exported nothing (wrong filter/profile) | Check the extension's scope; export the chatgpt.com domain |
+| `not a cookies export (expected a JSON list)` | Passed a Netscape `cookies.txt` or another format | Use the extension's **JSON** export, not `cookies.txt` |
+| `HTTP 429` / throttle warnings | Sliding-window rate limit (~50 body fetches) | Expected; the client paces and cools off. Let it finish, don't retry-storm |
+| `HTTP 403` on `/backend-api/...` | Fingerprint no longer matches | Bump `CHATGPT_IMPERSONATE` to a newer Chrome target (e.g. `chrome146`) |
+| `find` is slow / misses recent chats | Index behind; falling back to live grep | Run `chatgpt_sync` (pace it via cron for backfills) |
+
+Quick manual probe, bypassing Hermes entirely:
+
+```bash
+cd ~/.hermes/plugins/chatgpt-session-search
+python client.py status
+python client.py find "some topic"
+```
 
 ## Environment
 
