@@ -27,22 +27,120 @@ def _hermes_home() -> str:
         return os.path.expanduser("~/.hermes")
 
 
-STORAGE = os.environ.get(
-    "CHATGPT_PLUGIN_HOME", os.path.join(_hermes_home(), "chatgpt"))
+# Plugin settings (`plugin.yaml` → `config_schema`) land under
+# ``plugins.entries.<plugin_id>.settings`` and are edited from the Desktop
+# Plugins page. Resolution order per knob: env var (explicit override, used by
+# tests and CLI) → saved plugin setting → default. Read lazily, never at import,
+# so the plugin still discovers when config.yaml is absent or unreadable.
+PLUGIN_ID = "chatgpt-session-search"
+_SETTINGS_CACHE = [None]
+
+
+def _plugin_settings() -> dict:
+    """``plugins.entries.chatgpt-session-search.settings`` ({} when unavailable)."""
+    if _SETTINGS_CACHE[0] is not None:
+        return _SETTINGS_CACHE[0]
+    block = {}
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        if isinstance(cfg, dict):
+            entries = cfg.get("plugins", {})
+            if isinstance(entries, dict):
+                entries = entries.get("entries", {})
+            if isinstance(entries, dict):
+                entry = entries.get(PLUGIN_ID, {})
+            else:
+                entry = {}
+            if isinstance(entry, dict):
+                s = entry.get("settings", {})
+                if isinstance(s, dict):
+                    block = s
+    except Exception:
+        block = {}
+    _SETTINGS_CACHE[0] = block
+    return block
+
+
+def reload_settings() -> None:
+    """Drop the settings cache (used after a settings write, and by tests)."""
+    _SETTINGS_CACHE[0] = None
+
+
+def _setting(name, env_var, default):
+    """env override → saved plugin setting → default."""
+    raw = os.environ.get(env_var)
+    if raw not in (None, ""):
+        return raw
+    val = _plugin_settings().get(name)
+    if val in (None, ""):
+        return default
+    return val
+
+
+def _setting_float(name, env_var, default):
+    try:
+        return float(_setting(name, env_var, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _storage_dir():
+    return os.environ.get(
+        "CHATGPT_PLUGIN_HOME",
+        _setting("storage_dir", "CHATGPT_PLUGIN_HOME",
+                 os.path.join(_hermes_home(), "chatgpt")))
+
+
+class _Paths:
+    """Late-bound paths: STORAGE/MASTER_JAR/INDEX_DB follow the current settings."""
+
+    @property
+    def STORAGE(self):
+        return _storage_dir()
+
+    @property
+    def MASTER_JAR(self):
+        return os.path.join(_storage_dir(), "cookies.master.json")
+
+    @property
+    def INDEX_DB(self):
+        return os.path.join(_storage_dir(), "index.db")
+
+
+_paths = _Paths()
+STORAGE = _paths.STORAGE          # import-time snapshot (back-compat)
 MASTER_JAR = os.path.join(STORAGE, "cookies.master.json")
 INDEX_DB = os.path.join(STORAGE, "index.db")
 BASE = "https://chatgpt.com"
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")
-IMPERSONATE = os.environ.get("CHATGPT_IMPERSONATE", "chrome145")
+
+
+def _impersonate():
+    return _setting("impersonate", "CHATGPT_IMPERSONATE", "chrome145")
+
+
+def _ua():
+    ver = str(_setting("user_agent_version", "CHATGPT_UA_VERSION", "145"))
+    return ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            f"(KHTML, like Gecko) Chrome/{ver}.0.0.0 Safari/537.36")
+
+
+IMPERSONATE = _impersonate()      # import-time snapshot (back-compat)
+UA = _ua()
+
+
+def paths():
+    """Current paths object — authoritative when settings may have changed."""
+    return _paths
 
 
 def load_jar():
-    if not os.path.exists(MASTER_JAR):
+    jar = _paths.MASTER_JAR
+    if not os.path.exists(jar):
         raise RuntimeError(
-            f"no cookie jar at {MASTER_JAR} — import one with "
+            f"no cookie jar at {jar} — import one with "
             f"`chatgpt_import_cookies <path to cookies export>`")
-    with open(MASTER_JAR) as f:
+    with open(jar) as f:
         return json.load(f)
 
 
@@ -52,9 +150,9 @@ def make_session():
     ck = "; ".join(f"{c['name']}={c['value']}" for c in jar
                    if c["domain"].lstrip(".").endswith("chatgpt.com"))
     did = next((c["value"] for c in jar if c["name"] == "oai-did"), "")
-    s = cr.Session(impersonate=IMPERSONATE)
+    s = cr.Session(impersonate=_impersonate())
     s.headers.update({
-        "User-Agent": UA, "Cookie": ck, "Oai-Device-Id": did,
+        "User-Agent": _ua(), "Cookie": ck, "Oai-Device-Id": did,
         "Oai-Language": "en-US", "Referer": BASE + "/",
         "Origin": BASE, "Accept": "application/json",
     })
@@ -187,26 +285,37 @@ LIST_TTL = 300      # conversation list cache: 5 min
 # OpenAI's conversation endpoint enforces a sliding-window budget (~50 fetches)
 # then 429s for a few minutes. Policy: pace body fetches, and on 429 cool off
 # globally instead of hammering (hammering extends the block).
+# Live settings (Plugins page) win over these module defaults.
 PACE = float(os.environ.get("CHATGPT_PACE", "2.5"))   # min seconds between body fetches
 COOL = float(os.environ.get("CHATGPT_COOL", "90"))    # cool-off seconds on 429
 _last_fetch = [0.0]
 
 
+def _pace_secs():
+    return _setting_float("pace", "CHATGPT_PACE", PACE)
+
+
+def _cool_secs():
+    return _setting_float("cool", "CHATGPT_COOL", COOL)
+
+
 def _pace():
+    p = _pace_secs()
     dt = time.time() - _last_fetch[0]
-    if dt < PACE:
-        time.sleep(PACE - dt)
+    if dt < p:
+        time.sleep(p - dt)
     _last_fetch[0] = time.time()
 
 
 def _cool(reason):
-    print(f"[throttle] {reason} -> cooling off {COOL:.0f}s", file=sys.stderr)
-    time.sleep(COOL)
+    c = _cool_secs()
+    print(f"[throttle] {reason} -> cooling off {c:.0f}s", file=sys.stderr)
+    time.sleep(c)
 
 
 def _db():
-    db = sqlite3.connect(INDEX_DB)
-    os.chmod(INDEX_DB, 0o600)
+    db = sqlite3.connect(_paths.INDEX_DB)
+    os.chmod(_paths.INDEX_DB, 0o600)
     db.execute("""CREATE TABLE IF NOT EXISTS convs
         (id TEXT PRIMARY KEY, title TEXT, update_time TEXT, tail INTEGER)""")
     try:
@@ -226,7 +335,7 @@ def _db():
 
 def _list_cache_load():
     try:
-        db = sqlite3.connect(INDEX_DB)
+        db = sqlite3.connect(_paths.INDEX_DB)
         row = db.execute(
             "SELECT payload, fetched_at FROM list_cache WHERE id = 1").fetchone()
         db.close()
@@ -241,7 +350,7 @@ def _list_cache_save(items):
     try:
         slim = [{"id": i["id"], "title": i.get("title"),
                  "update_time": i.get("update_time")} for i in items]
-        db = sqlite3.connect(INDEX_DB)
+        db = sqlite3.connect(_paths.INDEX_DB)
         db.execute("CREATE TABLE IF NOT EXISTS list_cache "
                    "(id INTEGER PRIMARY KEY, payload TEXT, fetched_at REAL)")
         db.execute("INSERT OR REPLACE INTO list_cache VALUES (1, ?, ?)",
@@ -331,7 +440,9 @@ def cmd_get(a, as_md=False):
     total = len(msgs)
     limit = max(1, min(int(getattr(a, "limit", 0) or 0), 200)) or 50
     offset = max(0, int(getattr(a, "offset", 0) or 0))
-    budget = max(2000, int(getattr(a, "chars", 0) or PAGE_CHARS))
+    budget = max(2000, int(getattr(a, "chars", 0) or 0)
+                 or int(_setting_float("page_chars", "CHATGPT_PAGE_CHARS",
+                                       PAGE_CHARS)))
     end = total - offset                      # exclusive, 0-based
     lo = max(0, end - limit)
 
@@ -399,7 +510,7 @@ def cmd_sync(a):
                            d, tail=tail)
         ok += 1
         print(f"  [{n}/{len(todo)}] {it['title'][:55]}")
-    print(f"synced {ok}/{len(todo)} -> {INDEX_DB}")
+    print(f"synced {ok}/{len(todo)} -> {_paths.INDEX_DB}")
     if ok < len(todo):
         print(f"failed (rerun sync to retry): {len(todo) - ok}")
 
@@ -479,7 +590,8 @@ def cmd_search(a):
 
 
 def cmd_export(a):
-    out = a.out or os.path.join(STORAGE, "export")
+    out = a.out or _setting("export_dir", "CHATGPT_EXPORT_DIR",
+                            os.path.join(_paths.STORAGE, "export"))
     os.makedirs(out, exist_ok=True)
     api = API()
     idx = api.conversations()
@@ -542,11 +654,12 @@ def import_cookies(export_path):
             "LOGGED IN to chatgpt.com (needs "
             "'__Secure-next-auth.session-token'). "
             f"Scoped cookies found: {found or 'none'}")
-    os.makedirs(STORAGE, mode=0o700, exist_ok=True)
-    with open(MASTER_JAR, "w") as f:
+    os.makedirs(_paths.STORAGE, mode=0o700, exist_ok=True)
+    jar = _paths.MASTER_JAR
+    with open(jar, "w") as f:
         json.dump(out, f, indent=2)
-    os.chmod(MASTER_JAR, 0o600)
-    return {"imported": len(out), "jar": MASTER_JAR,
+    os.chmod(jar, 0o600)
+    return {"imported": len(out), "jar": jar,
             "chunks": sorted(c["name"] for c in out
                              if "__Secure-next-auth.session-token" in c["name"]),
             "cf_clearance": any(c["name"] == "cf_clearance" for c in out)}

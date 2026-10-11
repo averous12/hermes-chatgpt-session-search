@@ -122,6 +122,30 @@ decide whether the plugin works.
 - Tool descriptions state real latency/cost, and state when a tool is a setup
   step — the calling agent plans off the description alone.
 
+## Settings (`config_schema`)
+
+Tuning knobs are declared in `plugin.yaml` and rendered as a form on the
+Desktop Plugins page. They live at `plugins.entries.<plugin_id>.settings` in
+`config.yaml`.
+
+- **Resolution: env var → saved setting → default.** `_setting()` in
+  `client.py` implements it. The env var must keep winning: CLI, tests and CI
+  override that way without touching `config.yaml` (which agents cannot write).
+- **Read lazily, never at import.** `_plugin_settings()` caches one read;
+  `reload_settings()` drops it. Discovery imports `tools.py` in every Hermes
+  process, so config access must not happen at module scope.
+- **Paths are late-bound.** `client.paths()` (`STORAGE`/`MASTER_JAR`/`INDEX_DB`)
+  is the authority inside functions; the module-level `STORAGE`/`MASTER_JAR`/
+  `INDEX_DB` remain as import-time snapshots for back-compat. A setting changed
+  at runtime must be picked up by a *running* process — do not reintroduce a
+  captured path inside a function body.
+- **Credentials are never settings.** A `json`/`str` field is plaintext in
+  `config.yaml`; a cookie export there would be account access. Login stays on
+  `chatgpt_import_cookies` + the mode-600 jar. `plugin_regress.py` asserts no
+  credential-shaped `config_schema` key exists.
+- `surface` these in `chatgpt_status` under `settings` so the effective values
+  are always inspectable.
+
 ## Deploy = copy (two trees, one truth)
 
 - Truth: this repo. Installed: `~/.hermes/plugins/chatgpt-session-search/`

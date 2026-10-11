@@ -1,8 +1,9 @@
 name: chatgpt-session-search
-version: 1.0.0
+version: 1.1.0
 description: "ChatGPT Session Search — retrieve the user's ChatGPT conversations from any Hermes session: hybrid search (find), list, get, sync, cookie import. Browser-free: a stored cookie jar + Chrome TLS impersonation (curl_cffi). No OAuth, no browser automation, no obscura."
 author: Averous R
 kind: backend
+manifest_version: 2
 provides_tools:
   - chatgpt_status
   - chatgpt_find
@@ -10,3 +11,51 @@ provides_tools:
   - chatgpt_get
   - chatgpt_sync
   - chatgpt_import_cookies
+# Tuning knobs, rendered as a settings form on the Desktop Plugins page.
+# Credentials are deliberately NOT here: the cookie jar stays a mode-600 file
+# on disk (see README → "Set up the login"). Every knob has a CHATGPT_* env
+# equivalent, and the env var wins, so CLI/tests/CI can override without
+# touching config.yaml.
+config_schema:
+  storage_dir:
+    type: str
+    description: >-
+      Directory holding the cookie jar and search index. Defaults to
+      <hermes home>/chatgpt. Env: CHATGPT_PLUGIN_HOME.
+  pace:
+    type: float
+    default: 2.5
+    description: >-
+      Minimum seconds between conversation-body fetches. The ChatGPT backend
+      rate-limits a sliding window (~50 fetches, then 429s for minutes);
+      raising this slows backfills but avoids the block. Env: CHATGPT_PACE.
+  cool:
+    type: float
+    default: 90
+    description: >-
+      Cool-off seconds after an HTTP 429. Hammering during the block extends
+      it, so prefer a longer cool-off over more retries. Env: CHATGPT_COOL.
+  impersonate:
+    type: str
+    default: chrome145
+    description: >-
+      curl_cffi TLS/browser fingerprint target used to satisfy Cloudflare.
+      Bump to a newer Chrome target (e.g. chrome146) if requests start
+      returning 403. Env: CHATGPT_IMPERSONATE.
+  user_agent_version:
+    type: str
+    default: "145"
+    description: >-
+      Chrome major version used in the User-Agent header. Should match the
+      impersonate target. Env: CHATGPT_UA_VERSION.
+  page_chars:
+    type: int
+    default: 40000
+    description: >-
+      Character budget for one chatgpt_get markdown page (~10k tokens at the
+      default). Lower it for tighter context control. Env: CHATGPT_PAGE_CHARS.
+  export_dir:
+    type: str
+    description: >-
+      Directory where chatgpt_sync writes exports. Defaults to
+      <storage_dir>/export. Env: CHATGPT_EXPORT_DIR.

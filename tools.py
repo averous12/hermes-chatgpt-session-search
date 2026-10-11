@@ -37,7 +37,7 @@ def _jar_missing_error():
     client = _client()
     return tool_error(
         "not logged in: no ChatGPT cookie jar at "
-        f"{client.MASTER_JAR}. "
+        f"{client.paths().MASTER_JAR}. "
         "Set it up once: (1) log in to chatgpt.com in any browser, "
         "(2) export cookies as JSON with any cookie extension "
         "('Get cookies.txt LOCALLY' or Cookie-Editor), "
@@ -164,8 +164,8 @@ def _handle_status(args, **kw):
     Ordered as a checklist so a first-run agent can act on it directly.
     """
     client = _client()
-    payload = {"jar_exists": os.path.exists(client.MASTER_JAR),
-               "storage": client.STORAGE}
+    payload = {"jar_exists": os.path.exists(client.paths().MASTER_JAR),
+               "storage": client.paths().STORAGE}
     # dependency
     try:
         import curl_cffi
@@ -215,13 +215,22 @@ def _handle_status(args, **kw):
 
     try:
         import sqlite3
-        db = sqlite3.connect(client.INDEX_DB)
+        db = sqlite3.connect(client.paths().INDEX_DB)
         payload["indexed_conversations"] = db.execute(
             "SELECT count(*) FROM convs").fetchone()[0]
         db.close()
     except Exception:
         payload["indexed_conversations"] = 0
     payload["ready"] = True
+    # effective tuning (Plugins page → config_schema); env overrides shown too
+    payload["settings"] = {
+        "pace": client._pace_secs(),
+        "cool": client._cool_secs(),
+        "impersonate": client._impersonate(),
+        "page_chars": int(client._setting_float("page_chars",
+                                                "CHATGPT_PAGE_CHARS", 40000)),
+        "storage_dir": client.paths().STORAGE,
+    }
     return tool_result(payload)
 
 
@@ -234,7 +243,7 @@ def _handle_find(args, **kw):
     )
     if not a.query:
         return tool_error("query is required")
-    if not os.path.exists(_client().MASTER_JAR):
+    if not os.path.exists(_client().paths().MASTER_JAR):
         return _jar_missing_error()
     out, err = _run_cli(a)
     stages = [l.strip() for l in err.splitlines() if l.strip().startswith("[find]")]
@@ -247,7 +256,7 @@ def _handle_list(args, **kw):
                            limit=int(args.get("limit") or 0),
                            offset=int(args.get("offset") or 0))
     client = _client()
-    if not os.path.exists(client.MASTER_JAR):
+    if not os.path.exists(client.paths().MASTER_JAR):
         return _jar_missing_error()
     items = client.API().conversations()
     if a.offset:
@@ -264,7 +273,7 @@ def _handle_get(args, **kw):
     cid = str(args.get("conversation_id") or "").strip()
     if not cid:
         return tool_error("conversation_id is required")
-    if not os.path.exists(_client().MASTER_JAR):
+    if not os.path.exists(_client().paths().MASTER_JAR):
         return _jar_missing_error()
     fmt = str(args.get("format") or "markdown").lower()
     a = argparse.Namespace(cmd="get" if fmt == "json" else "get-md", cid=cid,
@@ -281,7 +290,7 @@ def _handle_get(args, **kw):
 
 
 def _handle_sync(args, **kw):
-    if not os.path.exists(_client().MASTER_JAR):
+    if not os.path.exists(_client().paths().MASTER_JAR):
         return _jar_missing_error()
     a = argparse.Namespace(
         cmd="sync",

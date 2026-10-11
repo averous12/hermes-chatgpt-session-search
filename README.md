@@ -83,6 +83,35 @@ Passwords are never stored.
 - **Rate limits.** OpenAI enforces a sliding-window budget (~50 body fetches, then 429s for minutes). The client paces body fetches (2.5s default, `CHATGPT_PACE`) and cools off 90s per 429 (`CHATGPT_COOL`) instead of hammering.
 - **List cache.** The conversation list is cached 5 minutes locally so `find` pays the multi-page round-trip at most once per window.
 
+## Settings (Plugins page)
+
+The plugin declares a `config_schema`, so the Desktop **Plugins** page renders a
+settings form on its row — no file editing needed:
+
+| Setting | Default | Env equivalent |
+|---|---|---|
+| `storage_dir` | `<hermes home>/chatgpt` | `CHATGPT_PLUGIN_HOME` |
+| `pace` | `2.5` | `CHATGPT_PACE` |
+| `cool` | `90` | `CHATGPT_COOL` |
+| `impersonate` | `chrome145` | `CHATGPT_IMPERSONATE` |
+| `user_agent_version` | `145` | `CHATGPT_UA_VERSION` |
+| `page_chars` | `40000` | `CHATGPT_PAGE_CHARS` |
+| `export_dir` | `<storage_dir>/export` | `CHATGPT_EXPORT_DIR` |
+
+Resolution order is **env var → saved setting → default**, so a shell/CI
+override always wins and the form is the fallback. Values are written to
+`plugins.entries.chatgpt-session-search.settings` in `config.yaml`; the writer
+type-checks each value against the manifest (a string where a number is
+declared is rejected).
+
+`chatgpt_status` echoes the effective values under `settings`, so you can always
+confirm what's actually in force.
+
+**Credentials are deliberately not a setting.** The cookie jar stays a mode-600
+file on disk. A cookie export in `config.yaml` would be plaintext account
+access, so the settings form is for tuning only — login stays with
+`chatgpt_import_cookies`.
+
 ## Troubleshooting
 
 All tools return a JSON `error` string instead of raising, so the calling agent
