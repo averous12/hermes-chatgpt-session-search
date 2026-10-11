@@ -1,4 +1,4 @@
-# hermes-plugin-chatgpt
+# ChatGPT Session Search
 
 ChatGPT conversation retrieval for [Hermes Agent](https://github.com/NousResearch/hermes-agent) — search, list, and fetch your ChatGPT chats from any Hermes session.
 
@@ -18,7 +18,7 @@ ChatGPT conversation retrieval for [Hermes Agent](https://github.com/NousResearc
 ## Install
 
 ```bash
-hermes plugins install <your-github-user>/hermes-plugin-chatgpt
+hermes plugins install <your-github-user>/chatgpt-session-search
 pip install curl_cffi     # the only dependency
 ```
 
