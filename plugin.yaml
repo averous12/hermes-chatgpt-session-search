@@ -1,0 +1,12 @@
+name: chatgpt
+version: 1.0.0
+description: "ChatGPT conversation retrieval — status, hybrid search (find), list, get, sync, cookie import. Browser-free: a stored cookie jar + Chrome TLS impersonation (curl_cffi). No OAuth, no browser automation, no obscura."
+author: Averous R
+kind: backend
+provides_tools:
+  - chatgpt_status
+  - chatgpt_find
+  - chatgpt_list
+  - chatgpt_get
+  - chatgpt_sync
+  - chatgpt_import_cookies

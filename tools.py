@@ -1,0 +1,253 @@
+"""ChatGPT session tools for Hermes (registered via plugins/chatgpt).
+
+Thin handlers over ``client.py``: the stored-cookie-jar ChatGPT backend.
+Heavy work (HTTP, FTS) happens in the handler calls, never at import time,
+so plugin discovery stays fast and never breaks on a missing jar.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import io
+import json
+import os
+import sys
+
+from tools.registry import tool_error, tool_result
+
+
+def _check_available() -> bool:
+    """Tools appear only when curl_cffi is importable."""
+    try:
+        import curl_cffi  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _client():
+    """Import the client lazily (it pulls in curl_cffi)."""
+    try:
+        from . import client
+    except ImportError:  # pragma: no cover - path-load fallback
+        import client
+    return client
+
+
+def _run_cli(cmd_args):
+    """Run a client command, capturing stdout; returns (payload, stderr_text).
+
+    Client commands print human-readable output — tools wrap that into JSON.
+    """
+    client = _client()
+    fn = {
+        "status": client.cmd_status,
+        "list": client.cmd_list,
+        "get": lambda a: client.cmd_get(a, False),
+        "get-md": lambda a: client.cmd_get(a, True),
+        "sync": client.cmd_sync,
+        "find": client.cmd_find,
+        "search": client.cmd_search,
+    }[cmd_args.cmd]
+    out, err = io.StringIO(), io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            fn(cmd_args)
+        return out.getvalue(), err.getvalue()
+    except RuntimeError as e:
+        # dead jar / Cloudflare / HTTP errors — actionable message for the agent
+        raise
+
+
+# ---------- schemas ----------
+
+def _schema(name, description, properties, required=()):
+    return {"name": name, "description": description,
+            "parameters": {"type": "object", "properties": properties,
+                           "required": list(required)}}
+
+
+_STR = {"type": "string"}
+_INT = {"type": "integer"}
+_BOOL = {"type": "boolean"}
+
+CHATGPT_STATUS_SCHEMA = _schema(
+    "chatgpt_status",
+    "Check the stored ChatGPT session: whether the cookie jar is alive, the "
+    "account email, and the local search-index size. Run this first when a "
+    "ChatGPT tool errors, or to confirm login after importing cookies.",
+    {})
+
+CHATGPT_FIND_SCHEMA = _schema(
+    "chatgpt_find",
+    "Quick hybrid search across the user's ChatGPT conversations (live titles "
+    "+ local full-text index + recent unsynced bodies). Results are newest "
+    "first with last-activity dates. Use for 'continue our chatgpt talk "
+    "about X' / 'did I ask chatgpt about X'. Sub-second when the index "
+    "covers the topic; up to ~20s when it falls back to live grepping.",
+    {"query": _STR, "recent": _INT, "deep": _BOOL},
+    ("query",))
+
+CHATGPT_LIST_SCHEMA = _schema(
+    "chatgpt_list",
+    "List the user's ChatGPT conversations (id, last-activity date, title), "
+    "newest first. Paginate with limit/offset.",
+    {"limit": _INT, "offset": _INT})
+
+CHATGPT_GET_SCHEMA = _schema(
+    "chatgpt_get",
+    "Fetch one ChatGPT conversation in full. Returns the transcript as "
+    "markdown by default (the branch as seen in the UI); pass format='json' "
+    "for the raw API payload including hidden branches and metadata.",
+    {"conversation_id": _STR, "format": _STR},
+    ("conversation_id",))
+
+CHATGPT_SYNC_SCHEMA = _schema(
+    "chatgpt_sync",
+    "Sync the local ChatGPT search index with the server (incremental — only "
+    "new/changed conversations). Slow for large backfills (~2.5s per "
+    "conversation, paced to respect rate limits); prefer scheduling via cron "
+    "over running interactively. --tail N indexes only the N newest messages "
+    "per conversation.",
+    {"tail": _INT, "limit": _INT})
+
+CHATGPT_IMPORT_COOKIES_SCHEMA = _schema(
+    "chatgpt_import_cookies",
+    "Import a ChatGPT login from a browser-extension cookies export (JSON "
+    "list from e.g. 'Get cookies.txt' / Cookie-Editor, exported while logged "
+    "in to chatgpt.com). Browser-agnostic: works from any browser's export. "
+    "Stores the jar and verifies the session end-to-end.",
+    {"path": _STR},
+    ("path",))
+
+
+# ---------- handlers ----------
+
+def _handle_status(args, **kw):
+    client = _client()
+    payload = {"jar_exists": os.path.exists(client.MASTER_JAR)}
+    if payload["jar_exists"]:
+        try:
+            d = client.API().session()
+            u = d.get("user") or {}
+            payload.update({
+                "hasToken": bool(d.get("accessToken")),
+                "email": u.get("email"),
+                "plan": u.get("chatgpt_plan_type") or u.get("plan_type"),
+            })
+        except Exception as e:
+            payload["error"] = f"{type(e).__name__}: {e}"
+    try:
+        import sqlite3
+        db = sqlite3.connect(client.INDEX_DB)
+        payload["indexed_conversations"] = db.execute(
+            "SELECT count(*) FROM convs").fetchone()[0]
+        db.close()
+    except Exception:
+        payload["indexed_conversations"] = 0
+    return tool_result(payload)
+
+
+def _handle_find(args, **kw):
+    a = argparse.Namespace(
+        cmd="find",
+        query=str(args.get("query") or "").strip(),
+        recent=int(args.get("recent") or 10),
+        deep=bool(args.get("deep") or False),
+    )
+    if not a.query:
+        return tool_error("query is required")
+    out, err = _run_cli(a)
+    stages = [l.strip() for l in err.splitlines() if l.strip().startswith("[find]")]
+    return tool_result({"query": a.query, "results": out.strip() or "no matches",
+                        "stages": stages})
+
+
+def _handle_list(args, **kw):
+    a = argparse.Namespace(cmd="list",
+                           limit=int(args.get("limit") or 0),
+                           offset=int(args.get("offset") or 0))
+    client = _client()
+    items = client.API().conversations()
+    if a.offset:
+        items = items[a.offset:]
+    if a.limit:
+        items = items[: a.limit]
+    slim = [{"id": i["id"], "title": i.get("title"),
+             "update_time": str(i.get("update_time") or "")[:10]}
+            for i in items]
+    return tool_result({"count": len(slim), "conversations": slim})
+
+
+def _handle_get(args, **kw):
+    cid = str(args.get("conversation_id") or "").strip()
+    if not cid:
+        return tool_error("conversation_id is required")
+    fmt = str(args.get("format") or "markdown").lower()
+    a = argparse.Namespace(cmd="get" if fmt == "json" else "get-md", cid=cid)
+    out, _ = _run_cli(a)
+    if fmt == "json":
+        try:
+            return tool_result(json.loads(out))
+        except Exception:
+            return tool_result({"raw": out})
+    return tool_result({"conversation_id": cid, "markdown": out})
+
+
+def _handle_sync(args, **kw):
+    a = argparse.Namespace(
+        cmd="sync",
+        tail=int(args["tail"]) if args.get("tail") not in (None, "") else None,
+        limit=int(args.get("limit") or 0),
+    )
+    out, err = _run_cli(a)
+    tail_line = [l for l in out.splitlines() if l.startswith("index:")]
+    done_line = [l for l in out.splitlines() if l.startswith("synced")]
+    return tool_result({
+        "summary": (tail_line + done_line) or out.strip(),
+        "throttle": [l.strip() for l in err.splitlines()
+                     if l.strip().startswith("[throttle]")],
+    })
+
+
+def _handle_import_cookies(args, **kw):
+    path = str(args.get("path") or "").strip()
+    if not path or not os.path.exists(path):
+        return tool_error(f"cookies export not found: {path!r}")
+    try:
+        res = _client().import_cookies(path)
+    except Exception as e:
+        return tool_error(f"import failed: {e}")
+    # verify end-to-end
+    try:
+        d = _client().API().session()
+        res["verified"] = bool(d.get("accessToken"))
+        res["email"] = (d.get("user") or {}).get("email")
+    except Exception as e:
+        res["verified"] = False
+        res["verify_error"] = f"{type(e).__name__}: {e}"
+    return tool_result(res)
+
+
+def register_tools(ctx) -> None:
+    """Entry point used by the plugin loader when provides_tools is declared."""
+    reg = ctx.register_tool
+    reg(name="chatgpt_status", toolset="chatgpt",
+        schema=CHATGPT_STATUS_SCHEMA, handler=_handle_status,
+        check_fn=_check_available, emoji="🔑")
+    reg(name="chatgpt_find", toolset="chatgpt",
+        schema=CHATGPT_FIND_SCHEMA, handler=_handle_find,
+        check_fn=_check_available, emoji="🔎")
+    reg(name="chatgpt_list", toolset="chatgpt",
+        schema=CHATGPT_LIST_SCHEMA, handler=_handle_list,
+        check_fn=_check_available, emoji="📜")
+    reg(name="chatgpt_get", toolset="chatgpt",
+        schema=CHATGPT_GET_SCHEMA, handler=_handle_get,
+        check_fn=_check_available, emoji="📄")
+    reg(name="chatgpt_sync", toolset="chatgpt",
+        schema=CHATGPT_SYNC_SCHEMA, handler=_handle_sync,
+        check_fn=_check_available, emoji="🔄")
+    reg(name="chatgpt_import_cookies", toolset="chatgpt",
+        schema=CHATGPT_IMPORT_COOKIES_SCHEMA, handler=_handle_import_cookies,
+        check_fn=_check_available, emoji="📦")
