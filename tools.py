@@ -97,10 +97,13 @@ CHATGPT_LIST_SCHEMA = _schema(
 
 CHATGPT_GET_SCHEMA = _schema(
     "chatgpt_get",
-    "Fetch one ChatGPT conversation in full. Returns the transcript as "
-    "markdown by default (the branch as seen in the UI); pass format='json' "
-    "for the raw API payload including hidden branches and metadata.",
-    {"conversation_id": _STR, "format": _STR},
+    "Fetch a ChatGPT conversation as a paginated transcript. Returns the "
+    "newest 50 messages as markdown by default; page backwards with offset "
+    "(skip N newest messages) and widen/narrow with limit (max 200). The "
+    "response header states the window and gives the exact offset for the "
+    "previous page. Pass format='json' for the raw API payload (unpaginated, "
+    "can be huge — prefer markdown).",
+    {"conversation_id": _STR, "format": _STR, "limit": _INT, "offset": _INT},
     ("conversation_id",))
 
 CHATGPT_SYNC_SCHEMA = _schema(
@@ -185,7 +188,9 @@ def _handle_get(args, **kw):
     if not cid:
         return tool_error("conversation_id is required")
     fmt = str(args.get("format") or "markdown").lower()
-    a = argparse.Namespace(cmd="get" if fmt == "json" else "get-md", cid=cid)
+    a = argparse.Namespace(cmd="get" if fmt == "json" else "get-md", cid=cid,
+                           limit=int(args.get("limit") or 50),
+                           offset=int(args.get("offset") or 0))
     out, _ = _run_cli(a)
     if fmt == "json":
         try:

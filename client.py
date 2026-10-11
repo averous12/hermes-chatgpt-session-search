@@ -313,7 +313,26 @@ def cmd_list(a):
 
 def cmd_get(a, as_md=False):
     d = API().conversation(a.cid)
-    print(mapping_to_markdown(d) if as_md else json.dumps(d, indent=2))
+    if not as_md:
+        print(json.dumps(d, indent=2))
+        return
+    # Windowed transcript: default the newest `limit` messages; `offset` skips
+    # that many from the END (so offset=50,limit=50 = the previous page).
+    msgs = messages_of(d)
+    total = len(msgs)
+    limit = max(1, min(int(getattr(a, "limit", 0) or 0), 200)) or 50
+    offset = max(0, int(getattr(a, "offset", 0) or 0))
+    end = total - offset
+    start = max(0, end - limit)
+    page = msgs[start:end]
+    md = [f"# {d.get('title') or 'Untitled'}", ""]
+    if total > len(page):
+        md.insert(2, f"*messages {start + 1}–{end} of {total} "
+                     f"(newest {offset} skipped; fetch with offset={offset + len(page)} "
+                     f"for the previous page)*\n")
+    for role, t in page:
+        md += ["**You**" if role == "user" else "**ChatGPT**", "", t, ""]
+    print("\n".join(md))
 
 
 def cmd_sync(a):
@@ -502,6 +521,11 @@ if __name__ == "__main__":
     p = sub.add_parser("list"); p.add_argument("--limit", type=int, default=0)
     p = sub.add_parser("get"); p.add_argument("cid")
     p = sub.add_parser("get-md"); p.add_argument("cid")
+    for _sp in (sub.choices["get-md"],):
+        _sp.add_argument("--limit", type=int, default=50,
+                         help="max messages returned (newest window; 1-200)")
+        _sp.add_argument("--offset", type=int, default=0,
+                         help="skip this many newest messages (page backwards)")
     p = sub.add_parser("sync"); p.add_argument("--tail", type=int, default=None)
     p.add_argument("--jobs", type=int, default=6)
     p = sub.add_parser("find"); p.add_argument("query")
