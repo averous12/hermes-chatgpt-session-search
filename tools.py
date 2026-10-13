@@ -143,6 +143,22 @@ CHATGPT_SYNC_SCHEMA = _schema(
     "per conversation.",
     {"tail": _INT, "limit": _INT})
 
+CHATGPT_MEMORIES_SCHEMA = _schema(
+    "chatgpt_memories",
+    "Read what ChatGPT remembers about the user — BOTH memory systems. "
+    "ChatGPT runs two storages side by side and either may be empty:\n"
+    "  * 'summary' — the newer on-demand synthesis ('what ChatGPT has learned "
+    "about you'), returned as titled narrative sections (Overview, work areas, "
+    "preferences...). Generated server-side and cached; costs no conversation "
+    "fetches.\n"
+    "  * 'legacy' — the older discrete 'saved memories' list, each an atomic "
+    "fact with a source conversation_id, plus a token budget counter.\n"
+    "Use kind='all' (default) to get both merged, which is almost always what "
+    "you want for 'what do you know about me'. Runs in ~1-3s (one SSE stream "
+    "plus one list call).",
+    {"kind": _STR, "limit": _INT, "fresh": _BOOL},
+    ())
+
 CHATGPT_IMPORT_COOKIES_SCHEMA = _schema(
     "chatgpt_import_cookies",
     "One-time setup step: import a ChatGPT login from a browser-extension "
@@ -307,6 +323,57 @@ def _handle_sync(args, **kw):
     })
 
 
+def _handle_memories(args, **kw):
+    client = _client()
+    if not os.path.exists(client.paths().MASTER_JAR):
+        return _jar_missing_error()
+    kind = str(args.get("kind") or "all").strip().lower()
+    if kind not in ("all", "summary", "new", "legacy", "entries"):
+        return tool_error("kind must be one of: all, summary, legacy")
+    limit = int(args.get("limit") or 0)
+    fresh = bool(args.get("fresh"))
+    try:
+        api = client.API()
+        out = {}
+        if kind in ("all", "summary", "new"):
+            s = client.about_you_summary(api, fresh=fresh)
+            out["summary"] = {
+                "generated_at": s.get("generated_at"),
+                "section_count": s.get("section_count"),
+                "sections": s.get("sections") or [],
+            }
+            # cheap staleness signal, no regeneration cost
+            try:
+                c = client.summary_checksum(api)
+                out["summary"]["is_stale"] = c.get("isStale")
+            except Exception:
+                pass
+        if kind in ("all", "legacy", "entries"):
+            m = client.legacy_memories(api, include_entries=True)
+            entries = m.get("memories") or []
+            if limit:
+                entries = entries[:limit]
+            out["legacy"] = {
+                "count": len(m.get("memories") or []),
+                "tokens": m.get("memory_num_tokens"),
+                "max_tokens": m.get("memory_max_tokens"),
+                "returned": len(entries),
+                "entries": [{"content": x.get("content"),
+                             "source_conversation_id": x.get("conversation_id")}
+                            for x in entries],
+            }
+        # tell the agent when there is genuinely nothing, so it doesn't
+        # report "no memories" when the call actually failed
+        if out.get("summary", {}).get("section_count") == 0 and \
+                not (out.get("legacy") or {}).get("count"):
+            out["note"] = ("both memory stores are empty for this account — "
+                           "the summary may be disabled in ChatGPT settings "
+                           "(Personalization → Memory summary)")
+        return tool_result(out)
+    except Exception as e:
+        return tool_error(f"memory read failed: {type(e).__name__}: {e}")
+
+
 def _handle_import_cookies(args, **kw):
     path = str(args.get("path") or "").strip()
     if not path or not os.path.exists(path):
@@ -363,3 +430,6 @@ def register_tools(ctx) -> None:
     reg(name="chatgpt_import_cookies", toolset="chatgpt",
         schema=CHATGPT_IMPORT_COOKIES_SCHEMA, handler=_handle_import_cookies,
         check_fn=_check_available, emoji="📦")
+    reg(name="chatgpt_memories", toolset="chatgpt",
+        schema=CHATGPT_MEMORIES_SCHEMA, handler=_handle_memories,
+        check_fn=_check_available, emoji="🧠")

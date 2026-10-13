@@ -11,6 +11,7 @@ provides_tools:
   - chatgpt_get
   - chatgpt_sync
   - chatgpt_import_cookies
+  - chatgpt_memories
 # Tuning knobs, rendered as a settings form on the Desktop Plugins page.
 # Credentials are deliberately NOT here: the cookie jar stays a mode-600 file
 # on disk (see README → "Set up the login"). Every knob has a CHATGPT_* env

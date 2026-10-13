@@ -14,6 +14,25 @@ ChatGPT conversation retrieval for [Hermes Agent](https://github.com/NousResearc
 | `chatgpt_get` | One conversation, full transcript (markdown) or raw JSON. |
 | `chatgpt_sync` | Incremental index sync (schedule via cron; paced for rate limits). |
 | `chatgpt_import_cookies` | Import a login from a browser cookies export. |
+| `chatgpt_memories` | What ChatGPT remembers about you — **both** memory systems (new on-demand summary + legacy saved entries). |
+
+### Two memory systems
+
+ChatGPT runs two memory storages side by side, and an account can have either,
+both, or neither populated:
+
+| System | Endpoint | Shape |
+|---|---|---|
+| **new** (on-demand synthesis) | `POST /backend-api/memories/about_you/summary/stream?source=personalization-setting` | Server-Sent Events; titled narrative sections ("Overview", "Karier Dan Riset", …). Generated server-side and cached — keyed on a checksum, so a repeat call is cheap. |
+| **legacy** (saved memories) | `GET /backend-api/memories?include_memory_entries=true` | Discrete atomic facts, each with a `conversation_id` back-pointer, plus a token budget. |
+
+`chatgpt_memories` defaults to `kind="all"`, which merges both — usually what
+you want for "what do you know about me". Use `kind="summary"` or
+`kind="legacy"` to read one. Both are read-only.
+
+> `include_memory_entries=false` is what the ChatGPT settings page uses: it
+> returns `memories: []` but keeps the token counters, so "how much memory is
+> stored" costs no entry payload. The tool always passes `true`.
 
 ## Install
 

@@ -222,6 +222,120 @@ class API:
                          paced=paced)
 
 
+# ---------- account / memory / personalization ----------
+#
+# Two memory systems coexist server-side and BOTH are live:
+#   * legacy: /backend-api/memories            -> discrete saved entries
+#   * new:    /backend-api/memories/about_you/summary/stream
+#                                              -> SSE "what ChatGPT learned about you"
+# An account can have one, both, or neither populated. Callers should merge.
+
+SUMMARY_SOURCE = "personalization-setting"
+
+
+def _auth(api):
+    return {"Authorization": f"Bearer {api.tok or api._mint()}"}
+
+
+def settings_user(api):
+    """Raw /backend-api/settings/user payload (personalization flags live here)."""
+    return api._get("/backend-api/settings/user")
+
+
+def legacy_memories(api, include_entries=True):
+    """Legacy saved memories.
+
+    ``include_memory_entries=False`` is what the settings page itself uses: it
+    returns ``memories: []`` while keeping the token counters, so a cheap
+    "how much memory is stored" probe costs no entry payload.
+    """
+    q = "true" if include_entries else "false"
+    return api._get(f"/backend-api/memories?include_memory_entries={q}")
+
+
+def summary_checksum(api):
+    """Staleness probe for the about-you summary (cheap; no generation)."""
+    return api._get(f"/backend-api/memories/about_you/summary/checksum"
+                    f"?source={SUMMARY_SOURCE}")
+
+
+def _parse_sse(text):
+    """Parse an SSE body into (meta, sections).
+
+    Events observed: ``started`` (generatedAtIso, sourceChecksum),
+    ``section_types`` (ordered section ids/titles), ``section`` (one per
+    section, in completion order — NOT guaranteed to match section_types).
+    Unknown events are ignored so a server-side addition can't break us.
+    """
+    meta, sections, order = {}, [], []
+    event = None
+    for line in text.splitlines():
+        if line.startswith("event:"):
+            event = line[6:].strip()
+        elif line.startswith("data:"):
+            raw = line[5:].strip()
+            if not raw:
+                continue
+            try:
+                data = json.loads(raw)
+            except ValueError:
+                continue
+            if event == "started":
+                meta.update({k: data.get(k) for k in
+                             ("generatedAtIso", "sourceChecksum")})
+            elif event == "section_types":
+                order = [s.get("title") for s in (data.get("sections") or [])]
+                meta["section_order"] = order
+            elif event == "section":
+                s = data.get("section") or {}
+                if s.get("id"):
+                    sections.append({"id": s.get("id"), "title": s.get("title"),
+                                     "description": s.get("description")})
+    # present in declared order when known, else arrival order
+    if order:
+        rank = {t: i for i, t in enumerate(order)}
+        sections.sort(key=lambda s: rank.get(s.get("title"), len(rank)))
+    return meta, sections
+
+
+def about_you_summary(api, fresh=False):
+    """The new on-demand memory summary.
+
+    Streams over SSE (POST with an empty JSON body). Cached server-side keyed on
+    the account's memory checksum — ``checksum()`` first to skip regeneration.
+    """
+    r = api.s.post(f"{BASE}/backend-api/memories/about_you/summary/stream"
+                   f"?source={SUMMARY_SOURCE}",
+                   headers={**_auth(api), "Content-Type": "application/json",
+                            "Accept": "text/event-stream"},
+                   json={}, timeout=120)
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code} on about_you/summary/stream: "
+                           f"{r.text[:200]}")
+    meta, sections = _parse_sse(r.text)
+    return {"generated_at": meta.get("generatedAtIso"),
+            "source_checksum": meta.get("sourceChecksum"),
+            "declared_sections": meta.get("section_order") or [],
+            "sections": sections,
+            "section_count": len(sections),
+            "fresh": fresh}
+
+
+def personality_options(api):
+    """Available style presets and trait sliders (read-only)."""
+    presets = api._get("/backend-api/personality_types")
+    traits = api._get("/backend-api/personality_trait_types")
+    return {
+        "presets": [{"key": p.get("key"), "label": p.get("label"),
+                     "description": p.get("description")}
+                    for p in (presets or [])],
+        "traits": [{"key": t.get("key"), "label": t.get("label"),
+                    "levels": [{"key": l.get("key"), "label": l.get("label")}
+                               for l in (t.get("levels") or [])]}
+                   for t in ((traits or {}).get("trait_types") or [])],
+    }
+
+
 def fetch_many(cids, token=None, workers=8):
     """Fetch several conversations concurrently (own session per worker).
     Returns {cid: data}; failures are dropped silently."""
@@ -616,6 +730,47 @@ def cmd_export(a):
     print(f"done: {ok}/{len(idx)} -> {out}")
 
 
+def cmd_memories(a):
+    """Merged memory view: new about-you summary + legacy entries."""
+    api = API()
+    which = (getattr(a, "kind", None) or "all").lower()
+    out = {}
+
+    if which in ("all", "summary", "new"):
+        try:
+            s = about_you_summary(api, fresh=getattr(a, "fresh", False))
+            if getattr(a, "json", False):
+                out["summary"] = s
+            else:
+                out["summary_generated"] = s.get("generated_at")
+                out["summary"] = {sec["title"]: sec["description"]
+                                  for sec in s.get("sections", [])}
+        except Exception as e:
+            out["summary_error"] = f"{type(e).__name__}: {e}"
+
+    if which in ("all", "legacy", "entries"):
+        try:
+            m = legacy_memories(api, include_entries=True)
+            entries = m.get("memories") or []
+            if getattr(a, "limit", 0):
+                entries = entries[: a.limit]
+            out["legacy"] = {
+                "count": len(m.get("memories") or []),
+                "tokens": m.get("memory_num_tokens"),
+                "max_tokens": m.get("memory_max_tokens"),
+                "entries": [{"content": x.get("content"),
+                             "created": x.get("created_timestamp"),
+                             "updated": x.get("last_updated"),
+                             "id": x.get("id"),
+                             "conversation_id": x.get("conversation_id")}
+                            for x in entries],
+            }
+        except Exception as e:
+            out["legacy_error"] = f"{type(e).__name__}: {e}"
+
+    print(json.dumps(out, indent=2, ensure_ascii=False))
+
+
 def import_cookies(export_path):
     """Convert a browser-extension cookies export (JSON list) to the plugin jar.
 
@@ -690,6 +845,15 @@ if __name__ == "__main__":
     p.add_argument("--limit", type=int, default=10)
     p = sub.add_parser("export"); p.add_argument("--out")
     p = sub.add_parser("import-cookies"); p.add_argument("path")
+    sub.add_parser("memories")
+    p.add_argument("--kind", choices=["all", "legacy", "summary", "new",
+                                      "entries"], default="all")
+    p.add_argument("--limit", type=int, default=0,
+                   help="cap legacy entries returned (0 = all)")
+    p.add_argument("--fresh", action="store_true",
+                   help="force summary regeneration instead of using the cache")
+    p.add_argument("--json", action="store_true",
+                   help="include raw section metadata")
     a = ap.parse_args()
     if a.cmd == "import-cookies":
         print(json.dumps(import_cookies(a.path), indent=2))
@@ -697,4 +861,5 @@ if __name__ == "__main__":
         {"status": cmd_status, "list": cmd_list,
          "get": lambda x: cmd_get(x, False), "get-md": lambda x: cmd_get(x, True),
          "sync": cmd_sync, "find": cmd_find, "search": cmd_search,
-         "export": cmd_export}[a.cmd](a)
+         "export": cmd_export,
+         "memories": cmd_memories}[a.cmd](a)
