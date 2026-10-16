@@ -89,11 +89,11 @@ python client.py find "timer"
 python client.py get-md <conversation-id> --chars 2000   # truncation edge case
 
 # registration smoke test: fake tools.registry + fake ctx, then exec __init__ —
-# assert all 6 tools register and check_fn returns True.
+# assert all 7 tools register and check_fn returns True.
 
 # through the real loader (installed copy must be refreshed first, see below):
 hermes plugins list | grep chatgpt-session-search
-hermes plugins doctor chatgpt-session-search      # expect: 6 tool(s), 0 hook(s)
+hermes plugins doctor chatgpt-session-search      # expect: 7 tool(s), 0 hook(s)
 hermes chat -q "Call chatgpt_status and report the email" -Q
 ```
 

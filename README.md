@@ -37,7 +37,7 @@ you want for "what do you know about me". Use `kind="summary"` or
 ## Install
 
 ```bash
-hermes plugins install <your-github-user>/chatgpt-session-search
+hermes plugins install averous12/hermes-chatgpt-session-search
 ```
 
 Install the one dependency **into the Hermes venv** (not your system Python —
@@ -55,7 +55,7 @@ Confirm the install, then enable the plugin and restart the gateway:
 
 ```bash
 hermes plugins enable chatgpt-session-search
-hermes plugins doctor chatgpt-session-search   # expect: 6 tool(s), 0 hook(s)
+hermes plugins doctor chatgpt-session-search   # expect: 7 tool(s), 0 hook(s)
 hermes gateway restart
 ```
 
